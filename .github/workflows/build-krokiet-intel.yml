@@ -1,0 +1,126 @@
+name: Build Krokiet for Intel Mac
+
+# Manual workflow: you start it yourself with the "Run workflow" button
+# (Actions tab -> "Build Krokiet for Intel Mac" -> Run workflow).
+on:
+  workflow_dispatch:
+
+# Needed so the workflow can publish the finished DMG on the "Releases" page of your repo
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Make the app run on macOS 13 (Ventura) and newer, even though the build machine runs macOS 15
+  MACOSX_DEPLOYMENT_TARGET: "13.0"
+  # Faster than the project's default "fat" LTO, still well optimized
+  CARGO_PROFILE_RELEASE_LTO: "thin"
+  CARGO_PROFILE_RELEASE_STRIP: "symbols"
+
+jobs:
+  build-intel:
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    steps:
+      - name: Get the source code
+        uses: actions/checkout@v6
+
+      - name: Install the Rust version the project asks for
+        run: rustup default 1.94.1
+
+      - name: Reuse downloads from previous runs (makes later builds faster)
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Krokiet (all renderers, it picks the one that works)
+        run: |
+          set -e
+          cargo build --locked --release --bin krokiet \
+            --no-default-features \
+            --features "winit_femtovg,winit_software,femtovg_wgpu,vello"
+
+      - name: Check the result
+        run: |
+          set -x
+          file target/release/krokiet
+          lipo -info target/release/krokiet
+          otool -l target/release/krokiet | grep -A4 LC_BUILD_VERSION || true
+          otool -L target/release/krokiet
+
+      - name: Create Krokiet.app with icon
+        run: |
+          set -e
+          VERSION=$(grep -m1 '^version' krokiet/Cargo.toml | cut -d'"' -f2)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+          APP="Krokiet.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/release/krokiet "$APP/Contents/MacOS/krokiet"
+          chmod +x "$APP/Contents/MacOS/krokiet"
+
+          # Build the .icns icon from the single 1024px PNG
+          SRC="misc/Krokiet_icon_1024.png"
+          ICONSET="Krokiet.iconset"
+          mkdir "$ICONSET"
+          for s in 16 32 128 256 512; do
+            d=$((s * 2))
+            sips -z $s $s "$SRC" --out "$ICONSET/icon_${s}x${s}.png"
+            sips -z $d $d "$SRC" --out "$ICONSET/icon_${s}x${s}@2x.png"
+          done
+          iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/Krokiet.icns"
+
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Krokiet</string>
+            <key>CFBundleDisplayName</key><string>Krokiet</string>
+            <key>CFBundleIdentifier</key><string>io.github.qarmin.krokiet</string>
+            <key>CFBundleExecutable</key><string>krokiet</string>
+            <key>CFBundleIconFile</key><string>Krokiet</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>LSMinimumSystemVersion</key><string>13.0</string>
+            <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$APP/Contents/Info.plist"
+
+          # "Ad-hoc" signature (no Apple developer account needed)
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --verbose "$APP"
+
+      - name: Create the DMG and a ZIP
+        run: |
+          set -e
+          mkdir dmg_root
+          cp -R Krokiet.app dmg_root/
+          ln -s /Applications dmg_root/Applications
+          hdiutil create -volname "Krokiet" -srcfolder dmg_root -ov -format UDZO "Krokiet-${VERSION}-intel.dmg"
+          ditto -c -k --keepParent Krokiet.app "Krokiet-${VERSION}-intel.zip"
+          ls -lh Krokiet-*
+
+      - name: Keep the files as a workflow download (backup)
+        uses: actions/upload-artifact@v6
+        with:
+          name: Krokiet-intel
+          path: |
+            Krokiet-*-intel.dmg
+            Krokiet-*-intel.zip
+
+      - name: Publish on the Releases page
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="intel-v${VERSION}-build${{ github.run_number }}"
+          gh release create "$TAG" \
+            "Krokiet-${VERSION}-intel.dmg" \
+            "Krokiet-${VERSION}-intel.zip" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Krokiet ${VERSION} for Intel Mac (build ${{ github.run_number }})" \
+            --notes "Unofficial Intel (x86_64) build of Krokiet ${VERSION}, built from the source code in this repository. Requires macOS 13 or newer. The app is not signed by Apple, so on first launch right-click the app and choose Open."
